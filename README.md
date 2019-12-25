@@ -2,7 +2,7 @@
 # Example
 ![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games.jpg)
 
-(correct word was "short-range"
+(correct word was "short-range")
 
 
 
