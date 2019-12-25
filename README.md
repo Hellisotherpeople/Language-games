@@ -1,3 +1,11 @@
+
+# Example
+![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games.jpg)
+
+
+
+
+
 # Language-games
 Dead simple games made with word vectors. 
 
@@ -16,4 +24,3 @@ The computer can optionally generate either a list of random words with a handfu
 (default is 6 golden ticket words and 50 random words) to serve as "inspiration" instead. My wife and I think that the default mode is more fun 
 
 
-# Example
