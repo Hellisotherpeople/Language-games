@@ -77,7 +77,7 @@ def validWord(word, letterList):
 
 
 
-### Game 1, competative word guessing 
+### Game 1, competitive word guessing 
 def game_loop_guessing(num_turns = 5, num_players = 2):
 	print("I'm thinking of a word.....")
 
@@ -319,7 +319,7 @@ def game_route_logic():
 
 	print("Please choose a game to play! \n")
 	print("Your options are: ")
-	print("Game 1: Competative Word Guessing")
+	print("Game 1: Competitive Word Guessing")
 	print("Game 2: Guessing the Closest Word to a Given Word")
 	print("Game 3: Guessing which words dont match the other words in a list")
 	print("Game 4: A Semantic Scrabble-like game")
