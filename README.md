@@ -12,7 +12,7 @@ Powered by the wonderful Word Vector Library: [Magnitude](https://github.com/pla
 
 1. Clone the repo 
 2. type `pip install -r requirements.txt`or `pip3 install -r requirments.txt` as needed. 
-3. Download one of these sets of word vectors available [here](magnitude.plasticity.ai/fasttext/heavy/crawl-300d-2M.magnitude) and/or [here](magnitude.plasticity.ai/glove/heavy/glove.6B.100d.magnitude)
+3. Download one of these sets of word vectors available [here](https://magnitude.plasticity.ai/fasttext/heavy/crawl-300d-2M.magnitude) and/or [here](https://magnitude.plasticity.ai/glove/heavy/glove.6B.100d.magnitude)
 4. Enjoy the game by running `python3 play_game.py
 
 # Screenshots
