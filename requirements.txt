@@ -1,2 +1,2 @@
-numpy==1.17.2
-pymagnitude==0.1.120
+numpy
+pymagnitude
