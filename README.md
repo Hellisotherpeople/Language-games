@@ -2,7 +2,7 @@
 Dead simple games made with Language Models and Word Vectors. 
 Powered by the wonderful Word Vector Library: [Magnitude](https://github.com/plasticityai/magnitude)
 
-- Game 1: Competative Word Guessing - Players try to guess a hidden word
+- Game 1: Competitive Word Guessing - Players try to guess a hidden word
 - Game 2: Guessing the closest word from a list to a given word 
 - Game 3: Guessing the word which DOESN'T match a list of other words
 - Game 4: A Semantic Scrabble-like game
