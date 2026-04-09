@@ -1,392 +1,738 @@
+#!/usr/bin/env python3
+"""Language Games — Semantic word games powered by word vectors.
+
+Uses GloVe vectors from Stanford NLP, loaded with a lightweight pure-numpy
+backend.  Models are downloaded and cached automatically on first run.
+"""
+
 import os
-import string
-from pymagnitude import *
-import sys
-import numpy as np
-from itertools import islice
-from collections import deque
-import csv
-from random import shuffle
-from time import time
 import random
+import string
+import sys
+import urllib.request
+import zipfile
 from collections import Counter
 
+import numpy as np
+from rich import box
+from rich.align import Align
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
+from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+WORD_FILE = os.path.join(SCRIPT_DIR, "words_alpha.txt")
+
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "language-games")
+GLOVE_ZIP_URL = "https://nlp.stanford.edu/data/glove.6B.zip"
+GLOVE_ZIP_SIZE = 862_182_613  # bytes (approximate)
+
+MODELS = {
+    "1": (50, "GloVe 50d  — light & fast"),
+    "2": (100, "GloVe 100d — good balance (recommended)"),
+    "3": (200, "GloVe 200d — higher quality"),
+    "4": (300, "GloVe 300d — best quality"),
+}
+
+TITLE = r"""
+  _
+ | |   __ _ _ _  __ _ _  _ __ _ __ _ ___
+ | |__/ _` | ' \/ _` | || / _` / _` / -_)
+ |____\__,_|_||_\__, |\_,_\__,_\__, \___|
+                |___/          |___/
+   ___
+  / __|__ _ _ __  ___ ___
+ | (_ / _` | '  \/ -_|_-<
+  \___\__,_|_|_|_\___/__/
+"""
+
+PLAYER_COLORS = [
+    "bright_cyan",
+    "bright_magenta",
+    "bright_yellow",
+    "bright_green",
+    "bright_red",
+    "bright_blue",
+    "deep_pink1",
+    "dark_orange",
+]
+
+# ---------------------------------------------------------------------------
+# Rich console (global)
+# ---------------------------------------------------------------------------
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# WordVectors — lightweight, pure-numpy word-embedding store
+# ---------------------------------------------------------------------------
 
 
+class WordVectors:
+    """Lightweight word-vector store backed by numpy."""
 
-def inner_product_rank_mag(a_set, use_weights=True):
-    np_of_vecs = np.asarray(a_set)
-    sims_mat = np.dot(np_of_vecs, np_of_vecs.transpose())
-    ranks = np.sum(sims_mat, axis = 0)
-    if use_weights:
-    	weighted_avg = np.average(np_of_vecs, axis = 0, weights = ranks)
+    def __init__(self, words: list[str], vectors: np.ndarray):
+        self.words = words
+        self._vectors = vectors  # (vocab, dim), float32
+        self._index: dict[str, int] = {w: i for i, w in enumerate(words)}
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._unit = vectors / norms  # L2-normalised
+
+    # -- membership / indexing ------------------------------------------
+
+    def __contains__(self, word: str) -> bool:
+        return word in self._index
+
+    @property
+    def key_to_index(self) -> dict[str, int]:
+        return self._index
+
+    # -- similarity operations ------------------------------------------
+
+    def similarity(self, w1: str, w2: str) -> float:
+        i, j = self._index.get(w1), self._index.get(w2)
+        if i is None or j is None:
+            return 0.0
+        return float(self._unit[i] @ self._unit[j])
+
+    def most_similar(self, word: str, topn: int = 10) -> list[tuple[str, float]]:
+        idx = self._index.get(word)
+        if idx is None:
+            raise KeyError(word)
+        sims = self._unit @ self._unit[idx]
+        sims[idx] = -2.0  # exclude the query word itself
+        if topn < len(sims):
+            top = np.argpartition(sims, -topn)[-topn:]
+        else:
+            top = np.arange(len(sims))
+        top = top[np.argsort(-sims[top])]
+        return [(self.words[i], float(sims[i])) for i in top]
+
+    def most_similar_to_given(self, word: str, candidates: list[str]) -> str:
+        idx = self._index.get(word)
+        if idx is None:
+            raise KeyError(word)
+        best, best_sim = None, -2.0
+        for w in candidates:
+            j = self._index.get(w)
+            if j is not None:
+                s = float(self._unit[idx] @ self._unit[j])
+                if s > best_sim:
+                    best, best_sim = w, s
+        if best is None:
+            raise KeyError("none of the candidates are in vocabulary")
+        return best
+
+    def doesnt_match(self, words: list[str]) -> str:
+        idxs, valid = [], []
+        for w in words:
+            j = self._index.get(w)
+            if j is not None:
+                idxs.append(j)
+                valid.append(w)
+        if len(idxs) < 2:
+            raise ValueError("need at least 2 words in vocabulary")
+        vecs = self._unit[idxs]
+        centroid = vecs.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid /= norm
+        return valid[int(np.argmin(vecs @ centroid))]
+
+
+# ---------------------------------------------------------------------------
+# Model downloading / caching
+# ---------------------------------------------------------------------------
+
+
+def _ensure_glove_zip() -> str:
+    """Download glove.6B.zip if not already cached.  Returns path."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    zip_path = os.path.join(CACHE_DIR, "glove.6B.zip")
+    if os.path.exists(zip_path):
+        return zip_path
+
+    console.print(
+        "\n[bold]Downloading GloVe vectors from Stanford NLP[/bold] (~822 MB)"
+    )
+    console.print(f"[dim]{GLOVE_ZIP_URL}[/dim]\n")
+
+    with Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("glove.6B.zip", total=GLOVE_ZIP_SIZE)
+
+        def _hook(block_num: int, block_size: int, total_size: int):
+            if total_size > 0:
+                progress.update(task, total=total_size)
+            progress.update(task, completed=block_num * block_size)
+
+        tmp_path = zip_path + ".part"
+        urllib.request.urlretrieve(GLOVE_ZIP_URL, tmp_path, reporthook=_hook)
+        os.rename(tmp_path, zip_path)
+
+    console.print("[green]Download complete.[/green]\n")
+    return zip_path
+
+
+def load_glove(dim: int = 100) -> WordVectors:
+    """Load GloVe vectors for the requested dimensionality (cached)."""
+    npz_path = os.path.join(CACHE_DIR, f"glove.6B.{dim}d.npz")
+
+    if os.path.exists(npz_path):
+        console.print(f"[dim]Loading cached vectors from {npz_path}[/dim]")
+        with console.status("[bold green]Loading vectors...[/bold green]"):
+            data = np.load(npz_path, allow_pickle=True)
+            wv = WordVectors(list(data["words"]), data["vectors"])
+        console.print(
+            f"[green]Loaded[/green] GloVe {dim}d ({len(wv.words):,} words)\n"
+        )
+        return wv
+
+    # Need to extract from zip first
+    zip_path = _ensure_glove_zip()
+    txt_name = f"glove.6B.{dim}d.txt"
+
+    console.print(f"[dim]Extracting {txt_name} from zip...[/dim]")
+    with console.status("[bold green]Parsing vectors (one-time)...[/bold green]"):
+        words: list[str] = []
+        rows: list[list[float]] = []
+        with zipfile.ZipFile(zip_path) as zf:
+            with zf.open(txt_name) as f:
+                for line in f:
+                    parts = line.decode("utf-8", errors="replace").rstrip().split(" ")
+                    words.append(parts[0])
+                    rows.append([float(x) for x in parts[1:]])
+        vectors = np.array(rows, dtype=np.float32)
+        del rows  # free memory
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        np.savez_compressed(npz_path, words=np.array(words, dtype=object), vectors=vectors)
+
+    wv = WordVectors(words, vectors)
+    console.print(
+        f"[green]Loaded[/green] GloVe {dim}d ({len(wv.words):,} words)\n"
+    )
+    return wv
+
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+model: WordVectors | None = None
+english_words: set[str] = set()
+english_words_list: list[str] = []
+dictionary_words: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Setup helpers
+# ---------------------------------------------------------------------------
+
+
+def player_tag(p: int) -> str:
+    c = PLAYER_COLORS[p % len(PLAYER_COLORS)]
+    return f"[bold {c}]Player {p + 1}[/bold {c}]"
+
+
+def load_dictionary():
+    global dictionary_words
+    with open(WORD_FILE) as f:
+        dictionary_words = {line.strip().lower() for line in f if line.strip()}
+
+
+def choose_and_load_model():
+    global model
+
+    console.print()
+    table = Table(
+        box=box.ROUNDED,
+        border_style="dim cyan",
+        title="[bold]Word-Vector Models[/bold]",
+        title_style="cyan",
+        padding=(0, 2),
+    )
+    table.add_column("#", style="bold cyan", width=3, justify="center")
+    table.add_column("Model", style="bold white")
+    table.add_column("Details", style="dim")
+    for key, (dim, desc) in MODELS.items():
+        table.add_row(key, f"glove.6B.{dim}d", desc)
+    console.print(Align.center(table))
+    console.print()
+    console.print(
+        "[dim]Vectors download once (~822 MB) and are cached in ~/.cache/language-games/[/dim]"
+    )
+
+    choice = Prompt.ask(
+        "\n[bold cyan]Select a model[/bold cyan]",
+        choices=list(MODELS.keys()),
+        default="2",
+    )
+    dim, _ = MODELS[choice]
+    model = load_glove(dim)
+
+
+def load_words(topic_word: str | None = None, num_words: int = 10000):
+    global english_words, english_words_list
+    assert model is not None
+
+    if topic_word:
+        try:
+            sims = model.most_similar(topic_word, topn=num_words)
+            english_words = {w for w, _ in sims} | {topic_word}
+        except KeyError:
+            console.print(
+                f"[yellow]'{topic_word}' not in vocabulary — using full dictionary[/yellow]"
+            )
+            english_words = {w for w in dictionary_words if w in model}
     else:
-    	weighted_avg = np.average(np_of_vecs, axis = 0)
-    return weighted_avg
+        with console.status(
+            "[dim]Filtering dictionary against model vocabulary...[/dim]"
+        ):
+            english_words = {w for w in dictionary_words if w in model}
 
+    english_words_list = list(english_words)
+    console.print(f"[green]Ready[/green] — {len(english_words):,} playable words\n")
 
-def load_words(topic_word = "market", num_words = 10000):
-	if topic_word:
-		most_sims = vectors.most_similar_approx(topic_word, topn = num_words, effort = 0.5)
-		sim_words = [item[0].lower() for item in most_sims]
-		valid_words = sim_words
-	else:
-		with open('words_alpha.txt') as word_file:
-			valid_words = set(word_file.read().split())
 
-	return valid_words
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
 
+
+def rand_word() -> str:
+    return random.choice(english_words_list)
 
 
-def get_random_words(num_words = 5):
-	sample = random.sample(english_words, num_words)
-	return sample 
+def rand_words(n: int = 5) -> list[str]:
+    return random.sample(english_words_list, min(n, len(english_words_list)))
 
-def get_random_word():
-	sample = random.sample(english_words, 1)[0]
-	return sample 
 
+def sim_color(score: float) -> str:
+    if score >= 0.65:
+        return "green"
+    if score >= 0.35:
+        return "yellow"
+    return "red"
 
-def get_topic_words(topic = "buisness", num_words = 10000):
-	most_sims = vectors.most_similar_approx(topic, topn = num_words, effort = 0.01)
-	golden_tickets = [item[0].lower() for item in most_sims]
+
+def sim_bar(score: float, width: int = 20) -> str:
+    clamped = max(0.0, min(1.0, score))
+    filled = int(clamped * width)
+    c = sim_color(score)
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    return f"[{c}]{bar} {score:+.4f}[/{c}]"
 
-def validWord(word, letterList):
-	isvalid = True
-	for char in word: 
-		if(word.count(char) > letterList.count(char)):
-			isvalid = False
-			break
-	return isvalid
-
-#print(random.sample(english_words, 5))
-
-
-
-
-
-#my_string = "For at least 20 years, upper-middle class, often tenured academics have been teaching young people that politics is a futile form of irony. I've watched Ivy League professors with tenure explain to graduate students with no health insurance that striking for pay is silly. I've heard smug male assholes with Ph.D.s describe registering voters as the"
-#print(my_string.split())
-#set_vec = vectors.query(my_string.lower().split())
-
-#pooled_vec = inner_product_rank_mag(set_vec, use_weights = True)
-
-#print(vectors.most_similar_approx(pooled_vec, topn = 10))
-
-
-
-
-
-### Game 1, competitive word guessing 
-def game_loop_guessing(num_turns = 5, num_players = 2):
-	print("I'm thinking of a word.....")
-
-	random_word = get_random_word().lower()
-	#random_word_list = rd_word_gen.get_random_words(minDictionaryCount = 5, minCorpusCount = 5)
-	#lower_random_word_list = [x.lower() for x in random_word_list]
-	print("Here are some words of inspiration that may guide you along your adventure :)")
-
-	most_sims = vectors.most_similar_approx(random_word, topn = 100, effort = 0.001)
-	golden_tickets = [item[0].lower() for item in most_sims]
-	canidate_words = golden_tickets #lower_random_word_list + golden_tickets
-	shuffle(canidate_words)
-	print(canidate_words)
-	print("\n")
-
-
-	player_scores = [0] * num_players
-	cur_player = 0
-
-	turns_left = num_turns
-	while turns_left > 0:
-		while cur_player < num_players:
-			print("Player " + str(cur_player) + " it is your turn to enter a word ")
-			p_word = input("Enter a word ")
-			print(p_word)
-			score = vectors.similarity(p_word, random_word)
-			print(score)
-			if score > player_scores[cur_player]:
-				print("You got closer to the right word! ")
-				player_scores[cur_player] = score
-
-			cur_player += 1 #flip the switch
-		cur_player = 0
-		turns_left -= 1
-		print("Turns left: ")
-		print(turns_left)
-
-	print("THE GAME IS NOW OVER ")
-	print("Final Scores: ")
-	print(player_scores)
-	print("The randomly chosen word by the computer was: " + random_word)
-	print("The canidate words in the inspiration list were:")
-	print(golden_tickets)
-
-
-
-
-def word_choice_logic(random_int_word = True, num_words = 5):
-	### game 2 helper function
-	print("I'm thinking of a word.....")
-	if random_int_word:
-		given_word = get_random_word().lower()
-	else:
-		given_word = input("give a word that you will have to select the most similar word from")
-
-	random_word_list = get_random_words(num_words = num_words)
-	lower_random_word_list = [x.lower() for x in random_word_list]
-
-	correct_word = vectors.most_similar_to_given(given_word, lower_random_word_list)
-
-	return given_word, lower_random_word_list, correct_word
-
-
-
-	### Game 2, guess closest word to a given word
-def game_loop_guessing_to_given(num_turns = 5, num_players = 2, random_int_word = False, num_words = 5):
-	print("I'm thinking of some words.....")
-	if random_int_word:
-		given_word = get_random_word().lower()
-	else:
-		given_word = input("give a word that you will have to select the most similar word from")
-
-	random_word_list = get_random_words(num_words = num_words)
-	lower_random_word_list = [x.lower() for x in random_word_list]
-
-	correct_word = vectors.most_similar_to_given(given_word, lower_random_word_list)
-	player_scores = [0] * num_players
-	cur_player = 0
-
-	turns_left = num_turns
-	while turns_left > 0:
-		while cur_player < num_players:
-			print("Player "  + str(cur_player) + " it is your turn!")
-			print("Your given word is: ")
-			print(given_word)
-			print("The list of words to choose from: ")
-			print(lower_random_word_list)
-			print("What do you choose? ")
-			chosen_word = input("Choose a word from the list which is most close to the given word: ")
-			if chosen_word == correct_word:
-				print("You are correct!")
-				player_scores[cur_player] += 1
-				print("Your current score is: ")
-				print(player_scores[cur_player])
-			else:
-				print("You were wrong! The correct word is: ")
-				print(correct_word)
-			given_word, lower_random_word_list, correct_word = word_choice_logic(random_int_word = random_int_word, num_words = num_words)
-			cur_player += 1 
-		cur_player = 0
-		turns_left -= 1
-		print("Turns left: ")
-		print(turns_left)
-
-	print("THE GAME IS NOW OVER")
-	print("Final Scores: ")
-	print(player_scores)
-
-
-
-def game_3_logic(num_words = 5):
-	print("I'm thinking of some words..... ")
-	random_word_list = get_random_words(num_words = num_words)
-	lower_random_word_list = [x.lower() for x in random_word_list]
-	correct_word = vectors.doesnt_match(lower_random_word_list)
-	return lower_random_word_list, correct_word
-
-
-def random_string(length):
-   letters = string.ascii_lowercase
-   return ''.join(random.choice(letters) for i in range(length))
-
-
-### Game 3, guess which word doesn't match the other words
-def game_loop_guess_not_matching(num_turns = 5, num_players = 2, num_words = 5):
-	print("I'm thinking of some words..... ")
-	random_word_list = get_random_words(num_words = num_words)
-	lower_random_word_list = [x.lower() for x in random_word_list]
-	player_scores = [0] * num_players
-	cur_player = 0
-
-	correct_word = vectors.doesnt_match(lower_random_word_list)
-
-	turns_left = num_turns
-	while turns_left > 0:
-		while cur_player < num_players:
-			print("Player "  + str(cur_player) + " it is your turn!")
-			print("Choose the word that DOESN'T MATCH the other words in the list: ")
-			print(lower_random_word_list)
-			not_match = input("Which word doesn't match the other words in the list?")
-			if not_match == correct_word:
-				print("You are correct!")
-				player_scores[cur_player] += 1
-				print("Your current score is: ")
-				print(player_scores[cur_player])
-			else:
-				print("You were wrong! The correct word is: ")
-				print(correct_word)
-			lower_random_word_list, correct_word = game_3_logic(num_words = num_words)
-			cur_player += 1
-		cur_player = 0 
-		turns_left -= 1
-		print("Turns left: ")
-		print(turns_left)
-
-	print("THE GAME IS NOW OVER")
-	print("Final Scores: ")
-	print(player_scores)
-
-
-### Game 6, 
-
-
-def semantic_scrabble_logic(num_characters = 10, random_int_word = True):
-	char_list = list(random_string(num_characters))
-	if random_int_word:
-		starting_word = get_random_word().lower()
-	else:
-		starting_word = input("Please enter a starting word")
-	return char_list, starting_word
-
-
-
-def game_loop_semantic_scrabble(num_turns = 5, num_players = 2, num_characters = 10, random_int_word = True):
-	char_list = list(random_string(num_characters))
-	if random_int_word:
-		starting_word = get_random_word().lower()
-	else:
-		starting_word = input("Please enter a starting word")
-
-
-
-
-	player_scores = [0] * num_players
-	cur_player = 0
-
-	turns_left = num_turns
-	while turns_left > 0:
-		while cur_player < num_players:
-			print("Player "  + str(cur_player) + " it is your turn!")
-			print("The word you are trying to match in meaning is: ")
-			print(starting_word)
-			print("Your char list is:")
-			print(char_list)
-			provided_word = input("Please input a valid word made from some or all of the provided characters")
-			if validWord(str(provided_word), char_list):
-				score = vectors.similarity(provided_word, starting_word)
-				print(score)
-				if score > player_scores[cur_player]:
-					print("You got closer to the right word!")
-					player_scores[cur_player] = score
-				else:
-					print("Your word isn't closer to the right word")
-					#print(score)
-				cur_player += 1 
-			else:
-				print("That is not a valid word, try again!")
-		char_list, starting_word = semantic_scrabble_logic(num_characters = num_characters, random_int_word = random_int_word)
-		cur_player = 0
-		turns_left -= 1 
-		print("Turns left: ")
-		print(turns_left)
-
-	print("THE GAME IS NOW OVER")
-	print("Final Scores: ")
-	print(player_scores)
-
-
-
-
-def game_route_logic():
-	print("Semantic Language Games v0.02, by Allen Roush \n")
-
-	global vectors
-	global english_words
-
-	f_loc = input("Enter the file location of your word vectors (default is 'crawl-300d-2M.magnitude') ")
-	if f_loc:
-		vectors = Magnitude(f_loc)
-	else:
-		vectors = Magnitude("crawl-300d-2M.magnitude")
-
-	u_tpc_word = input("Enter a topic word, or leave blank to use a large fully random dictionary (words_alpha.txt)")
-	if u_tpc_word:
-		u_n_tpc_words = int(input("Enter the number of words to populate the topic dictionary with (recommended is 10000)"))
-		english_words = load_words(topic_word = u_tpc_word, num_words = u_n_tpc_words)
-	else:
-		english_words = load_words(topic_word = False)
-
-	print("Please choose a game to play! \n")
-	print("Your options are: ")
-	print("Game 1: Competitive Word Guessing")
-	print("Game 2: Guessing the Closest Word to a Given Word")
-	print("Game 3: Guessing which words dont match the other words in a list")
-	print("Game 4: A Semantic Scrabble-like game")
-	print("All games can be played with any number of players")
-	game_choice = input("Choose a game to play by typing a number between 1 and 4:")
-	u_num_turns = int(input("How many turns do you want to play?"))
-	u_num_players = int(input("How many players will play?"))
-	if int(game_choice) == 1:
-		game_loop_guessing(num_turns = u_num_turns, num_players = u_num_players)
-	elif int(game_choice) == 2:
-		u_rd_int = bool(int(input("Enter 0 if you want to choose your own words, 1 if you want it to be random")))
-		u_num_words = input("Enter the number of words that you want to choose from each round (default is 5)")
-		print(u_rd_int)
-		game_loop_guessing_to_given(num_turns = u_num_turns, num_players = u_num_players, random_int_word = bool(u_rd_int), num_words = int(u_num_words))
-
-	elif int(game_choice) == 3:
-		u_num_words = input("Enter the number of words that you want to choose from each round (default is 5)")
-		game_loop_guess_not_matching(num_turns = u_num_turns, num_players = u_num_players, num_words = int(u_num_words))
-
-	elif int(game_choice) == 4:
-		u_char_num = int(input("Enter the number of characters to build words from each round (default is 10)"))
-		u_rd_int = bool(int(input("Enter 0 if you want to choose your own words, 1 if you want it to be random")))
-		game_loop_semantic_scrabble(num_turns = u_num_turns, num_players = u_num_players, num_characters = u_char_num, random_int_word = bool(u_rd_int))
-	else:
-		print("Invalid game choice, rerun the game!")
-
-game_route_logic()
-
-
-
-
-
-
-
-
-
-#game_loop_semantic_scrabble()
-#print(validWord("sett", ["t", "e", "t", "s"]))
-
-
-
-#a_str = "sett"
-#car_list = ["t", "e", "t", "s"]
-
-
-
-
-
-#print(validWord("tets", ["t", "e", "t", "s"]))
-
-### Game 2, guess most similar to given 
-### Game 3, guess which doesn't match
-### Game 4, guess which is closest to x number of words and farthest away from y number of words (analogies)
-### Game 5, enter a simple equation and guess what output is 
-### Game 6, semantic scrabble - get list of characters and create word closest in meaning to given word
-### Game 7, guess the correct word to complete the sentence/paragraph (masked language modeling) (score based on closest meaning to word )
-
-
-
-#my_string = "my dog is going for"
-#set_vec = vectors.query(my_string.lower().split())
-
-#pooled_vec = inner_product_rank_mag(set_vec, use_weights = True)
-
-
-#print(vectors.most_similar(pooled_vec, topn = 10000)) # 10k similar word lookup is possible
-
-
-
-
+
+def valid_letters(word: str, letters: list[str]) -> bool:
+    avail = Counter(letters)
+    for ch, need in Counter(word).items():
+        if avail.get(ch, 0) < need:
+            return False
+    return True
+
+
+def in_vocab(word: str) -> bool:
+    assert model is not None
+    return word in model
+
+
+def get_player_word(p: int, prompt: str = "Enter a word") -> str:
+    while True:
+        w = Prompt.ask(f"  {player_tag(p)} {prompt}").strip().lower()
+        if not w:
+            console.print("  [red]Please enter a word.[/red]")
+        elif not in_vocab(w):
+            console.print(
+                f"  [red]'{w}' is not in the vocabulary — try again.[/red]"
+            )
+        else:
+            return w
+
+
+# ---------------------------------------------------------------------------
+# Score display
+# ---------------------------------------------------------------------------
+
+
+def show_scores(
+    scores: list,
+    num_players: int,
+    label: str = "Score",
+    fmt: str = ".3f",
+):
+    console.print()
+    console.print(Rule("Final Scores", style="bold yellow"))
+    console.print()
+
+    table = Table(box=box.HEAVY_EDGE, border_style="yellow")
+    table.add_column("Player", justify="center", style="bold")
+    table.add_column(label, justify="center")
+    table.add_column("", justify="center", width=4)
+
+    best = max(scores)
+    for p in range(num_players):
+        s = f"{scores[p]:{fmt}}" if isinstance(scores[p], float) else str(scores[p])
+        winner = scores[p] == best
+        table.add_row(
+            player_tag(p),
+            f"[bold green]{s}[/bold green]" if winner else s,
+            "\U0001f451" if winner else "",
+        )
+
+    console.print(Align.center(table))
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Shared input helper
+# ---------------------------------------------------------------------------
+
+
+def _pick_number(p: int, n: int) -> int:
+    while True:
+        raw = Prompt.ask(f"  {player_tag(p)} pick (1\u2013{n})")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < n:
+                return idx
+        except ValueError:
+            pass
+        console.print(f"  [red]Enter a number between 1 and {n}.[/red]")
+
+
+# ===================================================================
+# Game 1 — Competitive Word Guessing
+# ===================================================================
+
+
+def game_1(num_turns: int = 5, num_players: int = 2):
+    assert model is not None
+    console.print(
+        Panel(
+            "[bold]Competitive Word Guessing[/bold]\n\n"
+            "Each round a secret word is chosen.  You see a list of semantic hints.\n"
+            "Type a word you think is close to the secret — similarity is your score.\n"
+            "Scores [bold]accumulate[/bold] across rounds.",
+            title="Game 1",
+            border_style="magenta",
+            padding=(1, 3),
+        )
+    )
+
+    scores = [0.0] * num_players
+
+    for turn in range(1, num_turns + 1):
+        secret = rand_word()
+        try:
+            hints = [w for w, _ in model.most_similar(secret, topn=100)]
+        except KeyError:
+            continue
+
+        console.print(Rule(f"Round {turn}/{num_turns}", style="magenta"))
+        console.print()
+
+        random.shuffle(hints)
+        hint_str = "  ".join(f"[dim]{h}[/dim]" for h in hints[:25])
+        console.print(
+            Panel(
+                hint_str,
+                title="[bold]Hints[/bold]",
+                border_style="dim magenta",
+                padding=(1, 2),
+            )
+        )
+        console.print()
+
+        for p in range(num_players):
+            word = get_player_word(p, "guess the secret word")
+            sim = float(model.similarity(word, secret))
+            scores[p] += sim
+            console.print(f"    {sim_bar(sim)}")
+            console.print()
+
+        console.print(
+            f"  Secret word: [bold white on magenta] {secret} [/bold white on magenta]\n"
+        )
+
+    show_scores(scores, num_players, "Total Similarity")
+
+
+# ===================================================================
+# Game 2 — Closest Word Selection
+# ===================================================================
+
+
+def game_2(num_turns: int = 5, num_players: int = 2, num_words: int = 5):
+    assert model is not None
+    console.print(
+        Panel(
+            "[bold]Closest Word Selection[/bold]\n\n"
+            "Pick the word from the list that is [bold]most similar[/bold] to the target.\n"
+            "1 point per correct answer.",
+            title="Game 2",
+            border_style="blue",
+            padding=(1, 3),
+        )
+    )
+
+    scores = [0] * num_players
+
+    for turn in range(1, num_turns + 1):
+        target = rand_word()
+        candidates = [w for w in rand_words(num_words) if in_vocab(w)]
+        if len(candidates) < 2:
+            continue
+        try:
+            answer = model.most_similar_to_given(target, candidates)
+        except KeyError:
+            continue
+
+        console.print(Rule(f"Round {turn}/{num_turns}", style="blue"))
+        console.print()
+        console.print(
+            f"  Target: [bold white on blue] {target} [/bold white on blue]\n"
+        )
+        for i, w in enumerate(candidates, 1):
+            console.print(f"    [bold cyan]{i}.[/bold cyan] {w}")
+        console.print()
+
+        for p in range(num_players):
+            idx = _pick_number(p, len(candidates))
+            chosen = candidates[idx]
+            if chosen == answer:
+                scores[p] += 1
+                console.print(f"    [green]Correct![/green]")
+            else:
+                console.print(f"    [red]Wrong.[/red]")
+            console.print()
+
+        # reveal similarities
+        console.print(f"  [bold blue]Answer:[/bold blue] [bold]{answer}[/bold]")
+        for w in candidates:
+            sim = float(model.similarity(target, w))
+            mark = " [bold green]<[/bold green]" if w == answer else ""
+            console.print(f"    {w:<20s} {sim_bar(sim)}{mark}")
+        console.print()
+
+    show_scores(scores, num_players, "Correct", fmt="d")
+
+
+# ===================================================================
+# Game 3 — Odd One Out
+# ===================================================================
+
+
+def game_3(num_turns: int = 5, num_players: int = 2, num_words: int = 5):
+    assert model is not None
+    console.print(
+        Panel(
+            "[bold]Odd One Out[/bold]\n\n"
+            "One word in the list doesn't belong.  Find the [bold]semantic outlier[/bold].\n"
+            "1 point per correct answer.",
+            title="Game 3",
+            border_style="green",
+            padding=(1, 3),
+        )
+    )
+
+    scores = [0] * num_players
+
+    for turn in range(1, num_turns + 1):
+        words = [w for w in rand_words(num_words) if in_vocab(w)]
+        if len(words) < 3:
+            continue
+        try:
+            outlier = model.doesnt_match(words)
+        except ValueError:
+            continue
+
+        console.print(Rule(f"Round {turn}/{num_turns}", style="green"))
+        console.print()
+        console.print("  Which word [bold]doesn't belong[/bold]?\n")
+        for i, w in enumerate(words, 1):
+            console.print(f"    [bold cyan]{i}.[/bold cyan] {w}")
+        console.print()
+
+        for p in range(num_players):
+            idx = _pick_number(p, len(words))
+            if words[idx] == outlier:
+                scores[p] += 1
+                console.print(f"    [green]Correct![/green]")
+            else:
+                console.print(f"    [red]Wrong.[/red]")
+            console.print()
+
+        console.print(
+            f"  [bold green]Outlier:[/bold green] [bold]{outlier}[/bold]\n"
+        )
+
+    show_scores(scores, num_players, "Correct", fmt="d")
+
+
+# ===================================================================
+# Game 4 — Semantic Scrabble
+# ===================================================================
+
+
+def game_4(
+    num_turns: int = 5,
+    num_players: int = 2,
+    num_chars: int = 10,
+):
+    assert model is not None
+    console.print(
+        Panel(
+            "[bold]Semantic Scrabble[/bold]\n\n"
+            "You get a target word and a rack of random letters.\n"
+            "Form a real word from those letters that is as\n"
+            "[bold]semantically similar[/bold] to the target as possible.\n"
+            "Scores [bold]accumulate[/bold] across rounds.",
+            title="Game 4",
+            border_style="red",
+            padding=(1, 3),
+        )
+    )
+
+    scores = [0.0] * num_players
+
+    for turn in range(1, num_turns + 1):
+        target = rand_word()
+        letters = [random.choice(string.ascii_lowercase) for _ in range(num_chars)]
+
+        console.print(Rule(f"Round {turn}/{num_turns}", style="red"))
+        console.print()
+        console.print(
+            f"  Target: [bold white on red] {target} [/bold white on red]\n"
+        )
+        tiles = "  ".join(
+            f"[bold white on dark_red] {l.upper()} [/bold white on dark_red]"
+            for l in letters
+        )
+        console.print(f"  {tiles}\n")
+
+        for p in range(num_players):
+            while True:
+                word = Prompt.ask(f"  {player_tag(p)} form a word").strip().lower()
+                if not word:
+                    console.print("  [red]Please enter a word.[/red]")
+                    continue
+                if not valid_letters(word, letters):
+                    console.print(
+                        f"  [red]'{word}' can't be formed from the available letters.[/red]"
+                    )
+                    continue
+                if not in_vocab(word):
+                    console.print(
+                        f"  [red]'{word}' is not in the model vocabulary.[/red]"
+                    )
+                    continue
+                if word not in dictionary_words:
+                    console.print(
+                        f"  [red]'{word}' is not a recognized English word.[/red]"
+                    )
+                    continue
+                break
+
+            sim = float(model.similarity(word, target))
+            scores[p] += sim
+            console.print(f"    {sim_bar(sim)}\n")
+
+    show_scores(scores, num_players, "Total Similarity")
+
+
+# ===================================================================
+# Main menu
+# ===================================================================
+
+GAME_TABLE_ROWS = [
+    ("1", "Competitive Guessing", "Guess the secret word from semantic hints"),
+    ("2", "Closest Word", "Pick the most similar word from a list"),
+    ("3", "Odd One Out", "Find the word that doesn't belong"),
+    ("4", "Semantic Scrabble", "Form words from letters to match a meaning"),
+]
+
+
+def show_menu():
+    table = Table(box=box.ROUNDED, border_style="bright_white", padding=(0, 2))
+    table.add_column("#", style="bold cyan", width=3, justify="center")
+    table.add_column("Game", style="bold")
+    table.add_column("Description", style="dim")
+    for row in GAME_TABLE_ROWS:
+        table.add_row(*row)
+    console.print(Align.center(table))
+    console.print()
+
+
+def main():
+    console.clear()
+    console.print(
+        Panel(
+            Align.center(Text(TITLE, style="bold cyan")),
+            subtitle="[dim]Semantic word games powered by word vectors[/dim]",
+            border_style="cyan",
+            padding=(0, 4),
+        )
+    )
+
+    load_dictionary()
+    choose_and_load_model()
+
+    while True:
+        use_topic = Confirm.ask(
+            "[bold]Filter words by a topic?[/bold]", default=False
+        )
+        if use_topic:
+            topic = Prompt.ask("  Enter a topic word").strip().lower()
+            load_words(topic_word=topic)
+        else:
+            load_words()
+
+        show_menu()
+        game = Prompt.ask(
+            "[bold cyan]Choose a game[/bold cyan]", choices=["1", "2", "3", "4"]
+        )
+        turns = IntPrompt.ask("[bold]Rounds[/bold]", default=5)
+        players = IntPrompt.ask("[bold]Players[/bold]", default=2)
+
+        if game == "1":
+            game_1(turns, players)
+        elif game == "2":
+            n = IntPrompt.ask("[bold]Words per round[/bold]", default=5)
+            game_2(turns, players, n)
+        elif game == "3":
+            n = IntPrompt.ask("[bold]Words per round[/bold]", default=5)
+            game_3(turns, players, n)
+        elif game == "4":
+            n = IntPrompt.ask("[bold]Letters per round[/bold]", default=10)
+            game_4(turns, players, n)
+
+        console.print()
+        if not Confirm.ask("[bold]Play again?[/bold]", default=True):
+            console.print("\n[dim]Thanks for playing![/dim]\n")
+            break
+
+
+if __name__ == "__main__":
+    main()

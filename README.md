@@ -1,30 +1,80 @@
-# Language-games
-Dead simple games made with Language Models and Word Vectors. 
-Powered by the wonderful Word Vector Library: [Magnitude](https://github.com/plasticityai/magnitude)
+# Language Games
 
-- Game 1: Competative Word Guessing - Players try to guess a hidden word
-- Game 2: Guessing the closest word from a list to a given word 
-- Game 3: Guessing the word which DOESN'T match a list of other words
-- Game 4: A Semantic Scrabble-like game
+Dead simple semantic word games powered by word vectors, played in the terminal.
 
+Uses [GloVe](https://nlp.stanford.edu/projects/glove/) vectors from Stanford NLP with a lightweight pure-numpy backend — no heavy ML frameworks required. Models download automatically on first run and are cached for instant reloading.
 
-# Install Instructions
+## Games
 
-1. Clone the repo 
-2. type `pip install -r requirements.txt`or `pip3 install -r requirments.txt` as needed. 
-3. Download one of these sets of word vectors available [here](http://magnitude.plasticity.ai/fasttext/heavy/crawl-300d-2M.magnitude) and/or [here](http://magnitude.plasticity.ai/glove/heavy/glove.6B.100d.magnitude)
-4. Enjoy the game by running `python3 play_game.py`
+| # | Game | How it works |
+|---|------|-------------|
+| 1 | **Competitive Guessing** | A secret word is chosen. You see semantic hints. Guess the word — cosine similarity is your score. |
+| 2 | **Closest Word** | Pick the word from a list that is most similar to a target word. |
+| 3 | **Odd One Out** | Find the word that doesn't belong in a group. |
+| 4 | **Semantic Scrabble** | Form words from random letter tiles that are semantically close to a target. |
 
-# Screenshots
+All games support any number of players. Scores accumulate across rounds.
 
-## Game 1: 
-![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games1.jpg)
+## Install
 
-## Game 2:
-![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games2.jpg)
+```bash
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
 
-## Game 3: 
-![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games3.jpg)
+Or with pip:
 
-## Game 4: 
-![](https://raw.githubusercontent.com/Hellisotherpeople/Language-games/master/language_games4.jpg)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run
+
+```bash
+python play_game.py
+```
+
+On first launch you choose a vector dimensionality. The GloVe zip (~822 MB) downloads once with a progress bar and is cached in `~/.cache/language-games/`. Subsequent launches load in seconds.
+
+## Screenshots
+
+### Title & Model Selection
+<img src="screenshots/title.svg" alt="Title screen">
+
+### Game Menu
+<img src="screenshots/game_menu.svg" alt="Game menu">
+
+### Game 1 — Competitive Guessing
+<img src="screenshots/game1.svg" alt="Game 1 gameplay">
+
+### Game 2 — Closest Word
+<img src="screenshots/game2.svg" alt="Game 2 gameplay">
+
+### Game 3 — Odd One Out
+<img src="screenshots/game3.svg" alt="Game 3 gameplay">
+
+### Game 4 — Semantic Scrabble
+<img src="screenshots/game4.svg" alt="Game 4 gameplay">
+
+### Final Scores
+<img src="screenshots/scores.svg" alt="Final scores">
+
+## How It Works
+
+Words are represented as dense vectors in a high-dimensional space (50–300 dimensions) where semantically similar words are closer together. The games use cosine similarity between these vectors to measure how related two words are.
+
+The `WordVectors` class is a lightweight, pure-numpy implementation that supports:
+- **Cosine similarity** between any two words
+- **Most-similar lookup** using fast `argpartition`
+- **Outlier detection** by finding the word furthest from the group centroid
+
+## Dependencies
+
+Just `numpy` and `rich` — no compiled ML libraries needed.
+
+## License
+
+MIT
